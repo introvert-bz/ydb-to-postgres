@@ -59,6 +59,22 @@ def decode_cell(raw, column):
     raise ValueError('Unsupported YDB type: ' + kind)
 
 
+def allocate_name(preferred, reserved):
+    """Keep readable names when possible, otherwise add a stable hash suffix."""
+    if len(preferred.encode('utf-8')) <= 63 and preferred not in reserved:
+        reserved.add(preferred)
+        return preferred
+    attempt = 0
+    while True:
+        digest = hashlib.sha256((preferred + ':' + str(attempt)).encode('utf-8')).hexdigest()[:10]
+        stem = preferred.encode('utf-8')[:52].decode('utf-8', errors='ignore')
+        candidate = stem + '_' + digest
+        if candidate not in reserved:
+            reserved.add(candidate)
+            return candidate
+        attempt += 1
+
+
 def main():
     os.umask(0o077)
     configure_csv()
@@ -80,6 +96,8 @@ def main():
     schema = ['BEGIN;', 'SET LOCAL search_path = public;']
     indexes, checks, descriptions, results = [], [], [], []
     mapping = {'UINT32': 'BIGINT', 'UTF8': 'TEXT', 'JSON': 'JSONB', 'DATETIME': 'TIMESTAMPTZ', 'TIMESTAMP': 'TIMESTAMPTZ', 'BOOL': 'BOOLEAN', 'INT32': 'BIGINT', 'INT64': 'BIGINT', 'JSON_DOCUMENT': 'JSONB'}
+    reserved = set(table_names)
+    primary_names = {name: allocate_name(name + '_pkey', reserved) for name in table_names}
     normalized.mkdir()
     for name in table_names:
         if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', name) or len(name.encode()) > 63:
@@ -106,17 +124,18 @@ def main():
             definitions.append('    ' + quote(column['name']) + ' ' + mapping[kind] + ('' if nullable and column['name'] not in description['primary_key'] else ' NOT NULL'))
             if kind == 'UINT32':
                 checks.append('ALTER TABLE public.' + quote(name) + ' ADD CHECK (' + quote(column['name']) + ' BETWEEN 0 AND 4294967295);')
-        definitions.append('    PRIMARY KEY (' + ', '.join(quote(key) for key in description['primary_key']) + ')')
+        definitions.append('    CONSTRAINT ' + quote(primary_names[name]) + ' PRIMARY KEY (' + ', '.join(quote(key) for key in description['primary_key']) + ')')
         schema.append('CREATE TABLE public.' + quote(name) + ' (\n' + ',\n'.join(definitions) + '\n);')
+        mapped_indexes = []
         for index in description.get('indexes', []):
             if 'global_index' not in index or any(key in index for key in ('global_async_index', 'global_vector_kmeans_tree_index', 'global_unique_index')):
                 raise ValueError('Special index requires explicit mapping: ' + name)
             if not index.get('index_columns') or not set(index['index_columns']) <= set(names):
                 raise ValueError('Invalid index columns')
-            if len((name + '_' + index['name']).encode()) > 63:
-                raise ValueError('PostgreSQL index name exceeds 63 bytes')
-            indexes.append('CREATE INDEX ' + quote(name + '_' + index['name']) + ' ON public.' + quote(name) + ' (' + ', '.join(quote(key) for key in index['index_columns']) + ');')
-        descriptions.append({'table': name, 'columns': [{'name': c['name'], 'ydb_type': type_info(c)[0], 'nullable': type_info(c)[1], 'postgres_nullable': type_info(c)[1] and c['name'] not in description['primary_key'], 'postgres_type': mapping[type_info(c)[0]]} for c in columns], 'primary_key': description['primary_key'], 'indexes': description.get('indexes', [])})
+            target_index = allocate_name(name + '_' + index['name'], reserved)
+            indexes.append('CREATE INDEX ' + quote(target_index) + ' ON public.' + quote(name) + ' (' + ', '.join(quote(key) for key in index['index_columns']) + ');')
+            mapped_indexes.append({'ydb_name': index['name'], 'postgres_name': target_index})
+        descriptions.append({'table': name, 'columns': [{'name': c['name'], 'ydb_type': type_info(c)[0], 'nullable': type_info(c)[1], 'postgres_nullable': type_info(c)[1] and c['name'] not in description['primary_key'], 'postgres_type': mapping[type_info(c)[0]]} for c in columns], 'primary_key': description['primary_key'], 'indexes': description.get('indexes', []), 'postgres_primary_key_name': primary_names[name], 'postgres_indexes': mapped_indexes})
         output = normalized / (name + '.jsonl')
         files = sorted(folder.glob('data_*.csv'))
         if not files:
