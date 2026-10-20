@@ -1,0 +1,15 @@
+# Real database exports and diagnostics must remain private.
+/private-backups/
+/work/
+*.log
+*.partial
+*.partial.jsonl
+.env
+.env.*
+!.env.example
+*iam-token*
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.DS_Store
