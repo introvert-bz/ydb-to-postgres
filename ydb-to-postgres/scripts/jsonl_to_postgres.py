@@ -35,7 +35,7 @@ def parse_schema(sql):
         name, body = match.groups()
         columns, keys = [], []
         for definition in split_definitions(body):
-            primary = re.fullmatch(r'PRIMARY\s+KEY\s*\(([^)]+)\)', definition, re.I)
+            primary = re.fullmatch(r'(?:CONSTRAINT\s+"?\w+"?\s+)?PRIMARY\s+KEY\s*\(([^)]+)\)', definition, re.I)
             if primary:
                 keys.extend(key.strip().strip(chr(34)) for key in primary[1].split(','))
                 continue
