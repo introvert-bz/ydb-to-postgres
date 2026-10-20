@@ -1,4 +1,0 @@
-interface:
-  display_name: "YDB → PostgreSQL"
-  short_description: "Дамп YDB и проверенная конвертация в PostgreSQL"
-  default_prompt: "Используй $ydb-to-postgres: скачай указанную YDB и подготовь исходный архив и архив для PostgreSQL с инструкцией для pgAdmin."
