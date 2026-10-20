@@ -12,12 +12,25 @@ import tempfile
 from native_io import count_rows, native_records
 
 
-def run(command, timeout=90):
-    result = subprocess.run(command, capture_output=True, timeout=timeout)
+def run(command, timeout=90, *, stage):
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Stage ' + stage + ': timed out; check connectivity and timeouts.') from None
+    except OSError:
+        raise RuntimeError('Stage ' + stage + ': CLI executable is unavailable; check --ydb-bin/--yc-bin.') from None
     if result.returncode:
-        # Do not echo subprocess stderr: authentication errors can contain secrets.
-        raise RuntimeError('Command failed (exit %s); check authentication, permissions and CLI version' % result.returncode)
+        # Never echo the command, stdout or stderr: they can contain credentials.
+        raise RuntimeError('Stage ' + stage + ': command failed (exit %s); check authentication, permissions and CLI version.' % result.returncode)
     return result.stdout
+
+
+def run_json(command, *, stage):
+    raw = run(command, stage=stage)
+    try:
+        return json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise RuntimeError('Stage ' + stage + ': unexpected CLI JSON format; check the supported CLI versions.') from None
 
 
 def write_json(path, value):
@@ -34,16 +47,16 @@ def download(args):
         token = args.iam_token_file
         if token is None:
             token = Path(temp) / 'iam-token'
-            token.write_bytes(run(yc + ['iam', 'create-token']).strip() + b'\n')
+            token.write_bytes(run(yc + ['iam', 'create-token'], stage='authentication').strip() + b'\n')
             token.chmod(0o600)
         base = [args.ydb_bin, '-e', args.endpoint, '-d', args.database, '--iam-token-file', str(token)]
         # Metadata is optional if user can read YDB but cannot inspect cloud resources.
         try:
-            metadata = json.loads(run(yc + ['ydb', 'database', 'get', '--id', args.database.rstrip('/').split('/')[-1], '--format', 'json']))
+            metadata = run_json(yc + ['ydb', 'database', 'get', '--id', args.database.rstrip('/').split('/')[-1], '--format', 'json'], stage='cloud_metadata')
         except (RuntimeError, subprocess.TimeoutExpired, ValueError, OSError):
             metadata = {'database': args.database, 'endpoint': args.endpoint, 'cloud_metadata_available': False}
         write_json(root / 'database.json', metadata)
-        objects = json.loads(run(base + ['scheme', 'ls', '--timeout', '30s', '-R', '-l', '--format', 'json']))
+        objects = run_json(base + ['scheme', 'ls', '--timeout', '30s', '-R', '-l', '--format', 'json'], stage='discovery')
         write_json(root / 'objects.json', objects)
         tables = sorted(item['path'] for item in objects if item['type'] == 'table' and not item['path'].startswith('.sys/'))
         if not tables:
@@ -52,12 +65,17 @@ def download(args):
         if any(not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', name) for name in tables):
             raise ValueError('Nested/unusual table paths require an explicit mapping before downloading')
         for name in tables:
-            schema = json.loads(run(base + ['scheme', 'describe', '--timeout', '30s', '--format', 'proto-json-base64', name]))
+            schema = run_json(base + ['scheme', 'describe', '--timeout', '30s', '--format', 'proto-json-base64', name], stage='schema:' + name)
             write_json(root / (name + '.schema.json'), schema)
-        with (root / 'dump.log').open('wb') as log:
-            result = subprocess.run(base + ['tools', 'dump', '--path', '.', '--output', str(root / 'native-dump'), '--avoid-copy', '--ordered', '--save-partial-result', '--exclude', r'^\.sys(/|$)'], stdout=log, stderr=log, timeout=args.dump_timeout)
+        try:
+            with (root / 'dump.log').open('wb') as log:
+                result = subprocess.run(base + ['tools', 'dump', '--path', '.', '--output', str(root / 'native-dump'), '--avoid-copy', '--ordered', '--save-partial-result', '--exclude', r'^\.sys(/|$)'], stdout=log, stderr=log, timeout=args.dump_timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('Stage dump: timed out; inspect the private dump.log. Partial files are not a complete backup.') from None
+        except OSError:
+            raise RuntimeError('Stage dump: cannot execute YDB CLI or write dump.log.') from None
         if result.returncode:
-            raise RuntimeError('Dump failed; preserved partial files are NOT a complete backup')
+            raise RuntimeError('Stage dump: command failed (exit %s); inspect the private dump.log. Partial files are not a complete backup.' % result.returncode)
         native = root / 'native-dump'
         if list(native.rglob('incomplete*')):
             raise ValueError('Dump contains incomplete markers; not a complete backup')
@@ -70,7 +88,7 @@ def download(args):
             rows = sum(count_rows(path, len(columns)) for path in files)
             downloaded.append({'table': name, 'rows': rows})
             try:
-                raw = run(base + ['table', 'query', 'execute', '--type', 'scan', '--format', 'json-base64', '-q', 'SELECT COUNT(*) AS row_count FROM `' + name + '`;'], timeout=args.count_timeout)
+                raw = run(base + ['table', 'query', 'execute', '--type', 'scan', '--format', 'json-base64', '-q', 'SELECT COUNT(*) AS row_count FROM `' + name + '`;'], timeout=args.count_timeout, stage='count:' + name)
                 values = [json.loads(line) for line in raw.decode().splitlines() if line.strip()]
                 if len(values) != 1 or not isinstance(values[0], dict):
                     raise ValueError('Unexpected count output')
@@ -99,7 +117,9 @@ def main():
     args = parser.parse_args()
     try:
         download(args)
-    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+    except RuntimeError as error:
+        parser.exit(1, str(error) + '\n')
+    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         parser.exit(1, type(error).__name__ + ': export did not complete; retain files for diagnosis, do not call them a full backup.\n')
 
 
