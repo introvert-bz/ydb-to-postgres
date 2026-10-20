@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +15,7 @@ import zipfile
 from jsonl_to_postgres import convert
 from verify_copy import verify
 from native_io import native_records
+from download_ydb import run, run_json
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -286,6 +289,58 @@ else:
                 call('native_to_postgres.py', restored, '--database', '/Root/synthetic')
                 call('package_copy.py', 'postgres', restored)
             self.assertEqual(verify(restored)['rows'], 4)
+
+    def test_index_names_do_not_collide_with_primary_keys_or_tables(self):
+        for index_name in ('pkey', 'by_flag', 'a' * 80):
+            with self.subTest(index=index_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / 'export'
+                fixture(root)
+                p = root / 'items.schema.json'
+                schema = json.loads(p.read_text())
+                schema['indexes'][0]['name'] = index_name
+                write_json(p, schema)
+                shutil.copytree(root / 'native-dump/items', root / 'native-dump/items_by_flag')
+                write_json(root / 'items_by_flag.schema.json', schema)
+                write_json(root / 'objects.json', [{'type': 'table', 'path': name} for name in ('items', 'items_by_flag')])
+                call('native_to_postgres.py', root, '--database', '/Root/synthetic')
+                sql = (root / 'postgres/001_initial_schema.sql').read_text()
+                relation_names = re.findall(r'(?:CREATE TABLE public\.|CREATE INDEX |CONSTRAINT )"([^" ]+)"', sql)
+                self.assertEqual(len(relation_names), len(set(relation_names)))
+                self.assertTrue(all(len(name.encode()) <= 63 for name in relation_names))
+                mapping = json.loads((root / 'schema-mapping.json').read_text())
+                for table in mapping:
+                    for index in table['postgres_indexes']:
+                        self.assertIn(index['postgres_name'], relation_names)
+                self.assertEqual(verify(root)['rows'], 8)
+
+    def test_stage_errors_do_not_expose_cli_output(self):
+        secret = 'OFFLINE_SECRET_SHOULD_NOT_APPEAR'
+        with self.assertRaises(RuntimeError) as ctx:
+            run([sys.executable, '-c', 'import sys; print("' + secret + '"); sys.stderr.write("' + secret + '"); sys.exit(7)'], stage='discovery')
+        self.assertIn('Stage discovery:', str(ctx.exception))
+        self.assertIn('exit 7', str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx:
+            run_json([sys.executable, '-c', 'print("' + secret + '")'], stage='schema:items')
+        self.assertIn('Stage schema:items:', str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx:
+            run([sys.executable, '-c', 'import time; time.sleep(1)'], timeout=0.01, stage='count:items')
+        self.assertIn('Stage count:items: timed out', str(ctx.exception))
+
+    def test_authentication_failure_names_stage_at_cli_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            fake = base / 'failing-cli'
+            fake.write_text('#!' + sys.executable + '\nimport sys\nprint("OFFLINE_SECRET_SHOULD_NOT_APPEAR")\nsys.exit(7)\n')
+            fake.chmod(0o700)
+            launcher = SCRIPTS.parent.parent / 'ydb_to_postgres.py'
+            command = [sys.executable, str(launcher), 'export'] if launcher.is_file() else [sys.executable, str(SCRIPTS / 'download_ydb.py')]
+            command += ['--database', '/Root/synthetic', '--endpoint', 'grpcs://offline.invalid:2135', '--profile', 'offline', '--ydb-bin', str(fake), '--yc-bin', str(fake), '--output', str(base / 'export')]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('Stage authentication:', result.stderr)
+            self.assertNotIn('OFFLINE_SECRET_SHOULD_NOT_APPEAR', result.stderr + result.stdout)
 
 
 if __name__ == '__main__':
